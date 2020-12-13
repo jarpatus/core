@@ -45,8 +45,11 @@ from homeassistant.util.dt import as_local, utcnow as dt_utcnow
 _LOGGER = logging.getLogger(__name__)
 
 CONF_START_TIME = "start_time"
+CONF_SUNRISE_TIME = "sunrise_time"
+CONF_SUNSET_TIME = "sunset_time"
 CONF_STOP_TIME = "stop_time"
 CONF_START_CT = "start_colortemp"
+CONF_SUNRISE_CT = "sunrise_colortemp"
 CONF_SUNSET_CT = "sunset_colortemp"
 CONF_STOP_CT = "stop_colortemp"
 CONF_BRIGHTNESS = "brightness"
@@ -64,8 +67,13 @@ PLATFORM_SCHEMA = vol.Schema(
         vol.Required(CONF_LIGHTS): cv.entity_ids,
         vol.Optional(CONF_NAME, default="Flux"): cv.string,
         vol.Optional(CONF_START_TIME): cv.time,
+        vol.Optional(CONF_SUNRISE_TIME): cv.time,
+        vol.Optional(CONF_SUNSET_TIME): cv.time,
         vol.Optional(CONF_STOP_TIME): cv.time,
-        vol.Optional(CONF_START_CT, default=4000): vol.All(
+        vol.Optional(CONF_START_CT, default=1900): vol.All(
+            vol.Coerce(int), vol.Range(min=1000, max=40000)
+        ),
+        vol.Optional(CONF_SUNRISE_CT, default=4000): vol.All(
             vol.Coerce(int), vol.Range(min=1000, max=40000)
         ),
         vol.Optional(CONF_SUNSET_CT, default=3000): vol.All(
@@ -133,8 +141,11 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     name = config.get(CONF_NAME)
     lights = config.get(CONF_LIGHTS)
     start_time = config.get(CONF_START_TIME)
+    sunrise_time = config.get(CONF_SUNRISE_TIME)
+    sunset_time = config.get(CONF_SUNSET_TIME)
     stop_time = config.get(CONF_STOP_TIME)
     start_colortemp = config.get(CONF_START_CT)
+    sunrise_colortemp = config.get(CONF_SUNRISE_CT)
     sunset_colortemp = config.get(CONF_SUNSET_CT)
     stop_colortemp = config.get(CONF_STOP_CT)
     brightness = config.get(CONF_BRIGHTNESS)
@@ -147,8 +158,11 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         hass,
         lights,
         start_time,
+        sunrise_time,
+        sunset_time,
         stop_time,
         start_colortemp,
+        sunrise_colortemp,
         sunset_colortemp,
         stop_colortemp,
         brightness,
@@ -161,7 +175,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     async def async_update(call=None):
         """Update lights."""
-        await flux.async_flux_update()
+        transition = call.data.get("transition", None) if call is not None else None
+        await flux.async_flux_update(None, transition)
 
     service_name = slugify(f"{name} update")
     hass.services.async_register(DOMAIN, service_name, async_update)
@@ -176,8 +191,11 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
         hass,
         lights,
         start_time,
+        sunrise_time,
+        sunset_time,
         stop_time,
         start_colortemp,
+        sunrise_colortemp,
         sunset_colortemp,
         stop_colortemp,
         brightness,
@@ -191,8 +209,11 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
         self.hass = hass
         self._lights = lights
         self._start_time = start_time
+        self._sunrise_time = sunrise_time
+        self._sunset_time = sunset_time
         self._stop_time = stop_time
         self._start_colortemp = start_colortemp
+        self._sunrise_colortemp = sunrise_colortemp
         self._sunset_colortemp = sunset_colortemp
         self._stop_colortemp = stop_colortemp
         self._brightness = brightness
@@ -242,61 +263,52 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
 
         self.async_write_ha_state()
 
-    async def async_flux_update(self, utcnow=None):
+    async def async_flux_update(self, utcnow=None, transition=None):
         """Update all the lights using flux."""
         if utcnow is None:
             utcnow = dt_utcnow()
+        if transition is None:
+            transition=self._transition
 
-        now = as_local(utcnow)
+        now = as_local(utcnow.replace(microsecond=0))
 
-        sunset = get_astral_event_date(self.hass, SUN_EVENT_SUNSET, now.date())
+        now_time = datetime.timedelta(hours=now.hour, minutes=now.minute)
         start_time = self.find_start_time(now)
+        sunrise_time = self.find_sunrise_time(now)
+        sunset_time = self.find_sunset_time(now)
         stop_time = self.find_stop_time(now)
 
-        if stop_time <= start_time:
-            # stop_time does not happen in the same day as start_time
-            if start_time < now:
-                # stop time is tomorrow
-                stop_time += datetime.timedelta(days=1)
-        elif now < start_time:
-            # stop_time was yesterday since the new start_time is not reached
-            stop_time -= datetime.timedelta(days=1)
-
-        if start_time < now < sunset:
+        if self.is_between_hours(now_time, start_time, sunrise_time):
+            # Dawn
+            time_state = "dawn"
+            time_start = start_time
+            time_end = sunrise_time
+            temp_start = self._start_colortemp
+            temp_end = self._sunrise_colortemp
+        elif self.is_between_hours(now_time, sunrise_time, sunset_time):
             # Daytime
             time_state = "day"
-            temp_range = abs(self._start_colortemp - self._sunset_colortemp)
-            day_length = int(sunset.timestamp() - start_time.timestamp())
-            seconds_from_start = int(now.timestamp() - start_time.timestamp())
-            percentage_complete = seconds_from_start / day_length
-            temp_offset = temp_range * percentage_complete
-            if self._start_colortemp > self._sunset_colortemp:
-                temp = self._start_colortemp - temp_offset
-            else:
-                temp = self._start_colortemp + temp_offset
+            time_start = sunrise_time
+            time_end = sunset_time
+            temp_start = self._sunrise_colortemp
+            temp_end = self._sunset_colortemp
+        elif self.is_between_hours(now_time, sunset_time, stop_time):
+            # Dusk
+            time_state = "dusk"
+            time_start = sunset_time
+            time_end = stop_time
+            temp_start = self._sunset_colortemp
+            temp_end = self._stop_colortemp
         else:
             # Night time
             time_state = "night"
+            time_start = stop_time
+            time_end = start_time
+            temp_start = self._stop_colortemp
+            temp_end = self._stop_colortemp
+        percentage_complete = self.calculate_elapsed(now_time, time_start, time_end)
+        temp = self.calculate_colortemp(percentage_complete, temp_start, temp_end)
 
-            if now < stop_time:
-                if stop_time < start_time and stop_time.day == sunset.day:
-                    # we need to use yesterday's sunset time
-                    sunset_time = sunset - datetime.timedelta(days=1)
-                else:
-                    sunset_time = sunset
-
-                night_length = int(stop_time.timestamp() - sunset_time.timestamp())
-                seconds_from_sunset = int(now.timestamp() - sunset_time.timestamp())
-                percentage_complete = seconds_from_sunset / night_length
-            else:
-                percentage_complete = 1
-
-            temp_range = abs(self._sunset_colortemp - self._stop_colortemp)
-            temp_offset = temp_range * percentage_complete
-            if self._sunset_colortemp > self._stop_colortemp:
-                temp = self._sunset_colortemp - temp_offset
-            else:
-                temp = self._sunset_colortemp + temp_offset
         rgb = color_temperature_to_rgb(temp)
         x_val, y_val, b_val = color_RGB_to_xy_brightness(*rgb)
         brightness = self._brightness if self._brightness else b_val
@@ -304,7 +316,7 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
             brightness = None
         if self._mode == MODE_XY:
             await async_set_lights_xy(
-                self.hass, self._lights, x_val, y_val, brightness, self._transition
+                self.hass, self._lights, x_val, y_val, brightness, transition
             )
             _LOGGER.debug(
                 "Lights updated to x:%s y:%s brightness:%s, %s%% "
@@ -317,7 +329,7 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
                 now,
             )
         elif self._mode == MODE_RGB:
-            await async_set_lights_rgb(self.hass, self._lights, rgb, self._transition)
+            await async_set_lights_rgb(self.hass, self._lights, rgb, transition)
             _LOGGER.debug(
                 "Lights updated to rgb:%s, %s%% of %s cycle complete at %s",
                 rgb,
@@ -329,7 +341,7 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
             # Convert to mired and clamp to allowed values
             mired = color_temperature_kelvin_to_mired(temp)
             await async_set_lights_temp(
-                self.hass, self._lights, mired, brightness, self._transition
+                self.hass, self._lights, mired, brightness, transition
             )
             _LOGGER.debug(
                 "Lights updated to mired:%s brightness:%s, %s%% "
@@ -342,14 +354,34 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
             )
 
     def find_start_time(self, now):
-        """Return sunrise or start_time if given."""
+        """Return dawn or start_time if given."""
         if self._start_time:
-            sunrise = now.replace(
+            dawn = now.replace(
                 hour=self._start_time.hour, minute=self._start_time.minute, second=0
             )
         else:
-            sunrise = get_astral_event_date(self.hass, SUN_EVENT_SUNRISE, now.date())
-        return sunrise
+            dawn = as_local(get_astral_event_date(self.hass, "dawn", now.date()))
+        return datetime.timedelta(hours=dawn.hour, minutes=dawn.minute)
+
+    def find_sunrise_time(self, now):
+        """Return sunrise or sunrise_time if given."""
+        if self._sunrise_time:
+            sunrise = now.replace(
+                hour=self._sunrise_time.hour, minute=self._sunrise_time.minute, second=0
+            )
+        else:
+            sunrise = as_local(get_astral_event_date(self.hass, SUN_EVENT_SUNRISE, now.date()))
+        return datetime.timedelta(hours=sunrise.hour, minutes=sunrise.minute)
+
+    def find_sunset_time(self, now):
+        """Return sunset or sunset_time if given."""
+        if self._sunset_time:
+            sunset = now.replace(
+                hour=self._sunset_time.hour, minute=self._sunset_time.minute, second=0
+            )
+        else:
+            sunset = as_local(get_astral_event_date(self.hass, SUN_EVENT_SUNSET, now.date()))
+        return datetime.timedelta(hours=sunset.hour, minutes=sunset.minute)
 
     def find_stop_time(self, now):
         """Return dusk or stop_time if given."""
@@ -358,5 +390,36 @@ class FluxSwitch(SwitchEntity, RestoreEntity):
                 hour=self._stop_time.hour, minute=self._stop_time.minute, second=0
             )
         else:
-            dusk = get_astral_event_date(self.hass, "dusk", now.date())
-        return dusk
+            dusk = as_local(get_astral_event_date(self.hass, "dusk", now.date()))
+        return datetime.timedelta(hours=dusk.hour, minutes=dusk.minute)
+
+    def is_between_hours(self, time, start, end):
+        """Check if time is between start time and end time."""
+        if start > end:
+            return start <= time or time < end
+        else: 
+            return start <= time < end;
+
+    def calculate_elapsed(self, time, start, end):
+        """Calculate percentage of time elapsed between start time and end time."""
+        if start > end:
+            length = datetime.timedelta(hours=24)-start+end
+            if start <= time:
+                elapsed = time-start
+            elif time < end:
+                elapsed = datetime.timedelta(hours=24)-start+time
+            else:
+                elapsed = datetime.timedelta(hours=0)
+        else:
+            length = end-start
+            elapsed = time-start
+        return elapsed/length;
+
+    def calculate_colortemp(self, percentage_complete, temp_start, temp_end):
+        """Calculate color temperature based on percentage of time elapsed."""
+        temp_range = abs(temp_start - temp_end)
+        temp_offset = temp_range * percentage_complete
+        if temp_start > temp_end:
+            return temp_start - temp_offset
+        else:
+            return temp_start + temp_offset
